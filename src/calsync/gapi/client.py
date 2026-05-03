@@ -1,8 +1,9 @@
 """Async Google Calendar REST client.
 
-Thin wrapper around httpx with typed error mapping. Read paths only in
-this module's first incarnation; write paths (insert/patch/delete/watch)
-arrive in a follow-up commit.
+Thin wrapper around httpx with typed error mapping. Covers the endpoints
+calsync needs: events (list/insert/patch/delete/watch), calendars (get),
+channels (stop). NO `update_event` method - the design forbids
+`events.update` (PUT) since it can strip extended properties.
 
 Auth is handed in: callers construct a `GoogleCalendarClient` after they
 already have a valid access_token via `ensure_access_token()` from
@@ -72,6 +73,29 @@ class GoogleCalendarClient:
             return r.json()
         raise _classify_error(r)
 
+    async def _post(self, url: str, *, json: dict | None = None, params: dict | None = None) -> dict:
+        headers = {**self._headers, 'Content-Type': 'application/json'}
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            r = await client.post(url, json=json, params=params or {}, headers=headers)
+        if r.is_success:
+            return r.json() if r.content else {}
+        raise _classify_error(r)
+
+    async def _patch(self, url: str, *, json: dict) -> dict:
+        headers = {**self._headers, 'Content-Type': 'application/json'}
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            r = await client.patch(url, json=json, headers=headers)
+        if r.is_success:
+            return r.json()
+        raise _classify_error(r)
+
+    async def _delete(self, url: str) -> None:
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            r = await client.delete(url, headers=self._headers)
+        if r.is_success:
+            return
+        raise _classify_error(r)
+
     async def list_events(
         self,
         calendar_id: str,
@@ -132,3 +156,74 @@ class GoogleCalendarClient:
         url = f'{GOOGLE_API_BASE}/calendars/primary'
         data = await self._get(url, {})
         return data['id']
+
+    async def insert_event(self, calendar_id: str, body: dict) -> dict:
+        """Wrapper for events.insert. Returns the created event dict.
+
+        Used to create mirror events. The body should already contain the
+        calsync_origin and calsync_mirror_key extended properties. Inserts
+        from this client deliberately do NOT send invitations to attendees;
+        mirror events have no attendees anyway, but pass `sendUpdates=none`
+        as belt-and-suspenders.
+        """
+        url = f'{GOOGLE_API_BASE}/calendars/{calendar_id}/events'
+        return await self._post(url, json=body, params={'sendUpdates': 'none'})
+
+    async def patch_event(self, calendar_id: str, event_id: str, body: dict) -> dict:
+        """Wrapper for events.patch. PARTIAL update - preserves extendedProperties.
+
+        Hard rule from the design plan: only patch_event. Never update_event
+        (PUT), which would replace the resource and strip our calsync_*
+        extended properties unless they were explicitly echoed back.
+
+        Returns the updated event dict.
+        """
+        url = f'{GOOGLE_API_BASE}/calendars/{calendar_id}/events/{event_id}'
+        return await self._patch(url, json=body)
+
+    async def delete_event(self, calendar_id: str, event_id: str) -> None:
+        """Wrapper for events.delete. Returns None on success.
+
+        Raises NotFoundError on 404 (already deleted), GoneError on 410
+        (resource permanently gone). Callers should treat both as success
+        for cleanup paths.
+        """
+        url = f'{GOOGLE_API_BASE}/calendars/{calendar_id}/events/{event_id}'
+        await self._delete(url)
+
+    async def watch_events(
+        self,
+        calendar_id: str,
+        *,
+        channel_id: str,
+        channel_token: str,
+        callback_url: str,
+        ttl_seconds: int = 7 * 86400,
+    ) -> dict:
+        """Register a push-notification channel via events.watch.
+
+        We choose the channel_id (UUIDv4 expected). Google returns a
+        resourceId that we MUST store and validate on every incoming
+        webhook (tuple match per design).
+
+        Returns the watch response dict, which includes resourceId and
+        expiration (epoch ms) among other fields.
+        """
+        url = f'{GOOGLE_API_BASE}/calendars/{calendar_id}/events/watch'
+        body = {
+            'id': channel_id,
+            'type': 'web_hook',
+            'address': callback_url,
+            'token': channel_token,
+            'params': {'ttl': str(ttl_seconds)},
+        }
+        return await self._post(url, json=body)
+
+    async def stop_channel(self, channel_id: str, resource_id: str) -> None:
+        """Stop a previously-registered watch channel via channels.stop.
+
+        Best-effort during renewal: if Google returns NotFoundError or
+        GoneError, the channel is already stopped/expired and that's fine.
+        """
+        url = f'{GOOGLE_API_BASE}/channels/stop'
+        await self._post(url, json={'id': channel_id, 'resourceId': resource_id})
