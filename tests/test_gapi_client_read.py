@@ -13,7 +13,8 @@ from calsync.gapi.errors import GoneError, GoogleApiError, NotFoundError, RateLi
 
 @pytest.fixture
 def client() -> GoogleCalendarClient:
-    return GoogleCalendarClient(access_token='at-test')
+    # retry_base_wait=0 keeps tests fast; retry behavior itself is tested in test_gapi_retry_throttle.
+    return GoogleCalendarClient(access_token='at-test', retry_base_wait=0.0, retry_max_wait=0.0)
 
 
 # --- list_events ---

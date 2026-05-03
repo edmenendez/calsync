@@ -13,7 +13,8 @@ from calsync.gapi.errors import GoneError, NotFoundError, RateLimitError
 
 @pytest.fixture
 def client() -> GoogleCalendarClient:
-    return GoogleCalendarClient(access_token='at-test')
+    # retry_base_wait=0 keeps tests fast; retry behavior itself is tested in test_gapi_retry_throttle.
+    return GoogleCalendarClient(access_token='at-test', retry_base_wait=0.0, retry_max_wait=0.0)
 
 
 # --- insert_event ---
@@ -121,7 +122,9 @@ async def test_patch_event_only_sends_provided_fields(client):
     with respx.mock:
         respx.patch(f'{GOOGLE_API_BASE}/calendars/x/events/e1').mock(side_effect=_capture)
         await client.patch_event(
-            'x', 'e1', {'start': {'dateTime': '2026-05-04T10:00:00Z'}},
+            'x',
+            'e1',
+            {'start': {'dateTime': '2026-05-04T10:00:00Z'}},
         )
     assert 'start' in captured['body']
     assert 'summary' not in captured['body']
@@ -235,7 +238,9 @@ async def test_watch_events_passes_token(client):
     with respx.mock:
         respx.post(f'{GOOGLE_API_BASE}/calendars/x/events/watch').mock(side_effect=_capture)
         await client.watch_events(
-            'x', channel_id='c', channel_token='secret-shared-token',
+            'x',
+            channel_id='c',
+            channel_token='secret-shared-token',
             callback_url='https://x/cb',
         )
     assert 'secret-shared-token' in captured['body']

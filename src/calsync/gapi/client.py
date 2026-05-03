@@ -8,11 +8,29 @@ channels (stop). NO `update_event` method - the design forbids
 Auth is handed in: callers construct a `GoogleCalendarClient` after they
 already have a valid access_token via `ensure_access_token()` from
 `gapi.auth`. The client itself does NOT refresh tokens; that's a layer up.
+
+Two layers of rate-limit defense:
+
+1. **Proactive throttling**: a per-account asyncio.Semaphore caps
+   concurrent in-flight requests at 10 (per the design's 600/min/user
+   budget). The semaphore is shared across all clients for the same
+   account; see gapi.throttle.get_account_semaphore.
+
+2. **Retry on 429/403 rateLimitExceeded**: tenacity AsyncRetrying with
+   exponential backoff + jitter, 5 attempts max. Only RateLimitError
+   triggers retry; permission-denied 403s and other errors fail fast.
 """
 
+import asyncio
 from typing import Any
 
 import httpx
+from tenacity import (
+    AsyncRetrying,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential_jitter,
+)
 
 from calsync.gapi.errors import (
     GoneError,
@@ -24,6 +42,11 @@ from calsync.gapi.errors import (
 GOOGLE_API_BASE = 'https://www.googleapis.com/calendar/v3'
 
 RATE_LIMIT_REASONS = frozenset({'rateLimitExceeded', 'userRateLimitExceeded'})
+
+DEFAULT_PER_ACCOUNT_CONCURRENCY = 10
+DEFAULT_RETRY_MAX_ATTEMPTS = 5
+DEFAULT_RETRY_BASE_WAIT = 1.0
+DEFAULT_RETRY_MAX_WAIT = 30.0
 
 
 def _classify_error(response: httpx.Response) -> GoogleApiError:
@@ -56,45 +79,82 @@ class GoogleCalendarClient:
     The same client is reusable across multiple calls until the access
     token expires; callers are expected to construct a new one (with a
     refreshed token) when needed.
+
+    Pass `semaphore` to share concurrency limits across multiple clients
+    for the same account. Pass `retry_max_attempts=1` and `retry_base_wait=0`
+    in tests to bypass retry/wait behavior.
     """
 
-    def __init__(self, access_token: str, *, timeout: float = 10.0):
+    def __init__(
+        self,
+        access_token: str,
+        *,
+        timeout: float = 10.0,
+        semaphore: asyncio.Semaphore | None = None,
+        retry_max_attempts: int = DEFAULT_RETRY_MAX_ATTEMPTS,
+        retry_base_wait: float = DEFAULT_RETRY_BASE_WAIT,
+        retry_max_wait: float = DEFAULT_RETRY_MAX_WAIT,
+    ):
         self._access_token = access_token
         self._timeout = timeout
+        self._sem = semaphore if semaphore is not None else asyncio.Semaphore(DEFAULT_PER_ACCOUNT_CONCURRENCY)
+        self._retry_max_attempts = retry_max_attempts
+        self._retry_base_wait = retry_base_wait
+        self._retry_max_wait = retry_max_wait
 
     @property
     def _headers(self) -> dict[str, str]:
         return {'Authorization': f'Bearer {self._access_token}', 'Accept': 'application/json'}
 
+    def _retrying(self) -> AsyncRetrying:
+        return AsyncRetrying(
+            retry=retry_if_exception_type(RateLimitError),
+            stop=stop_after_attempt(self._retry_max_attempts),
+            wait=wait_exponential_jitter(initial=self._retry_base_wait, max=self._retry_max_wait, jitter=0.5),
+            reraise=True,
+        )
+
     async def _get(self, url: str, params: dict[str, Any]) -> dict:
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            r = await client.get(url, params=params, headers=self._headers)
-        if r.is_success:
-            return r.json()
-        raise _classify_error(r)
+        async for attempt in self._retrying():
+            with attempt:
+                async with self._sem, httpx.AsyncClient(timeout=self._timeout) as client:
+                    r = await client.get(url, params=params, headers=self._headers)
+                if r.is_success:
+                    return r.json()
+                raise _classify_error(r)
+        raise RuntimeError('unreachable')  # pragma: no cover
 
     async def _post(self, url: str, *, json: dict | None = None, params: dict | None = None) -> dict:
         headers = {**self._headers, 'Content-Type': 'application/json'}
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            r = await client.post(url, json=json, params=params or {}, headers=headers)
-        if r.is_success:
-            return r.json() if r.content else {}
-        raise _classify_error(r)
+        async for attempt in self._retrying():
+            with attempt:
+                async with self._sem, httpx.AsyncClient(timeout=self._timeout) as client:
+                    r = await client.post(url, json=json, params=params or {}, headers=headers)
+                if r.is_success:
+                    return r.json() if r.content else {}
+                raise _classify_error(r)
+        raise RuntimeError('unreachable')  # pragma: no cover
 
     async def _patch(self, url: str, *, json: dict) -> dict:
         headers = {**self._headers, 'Content-Type': 'application/json'}
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            r = await client.patch(url, json=json, headers=headers)
-        if r.is_success:
-            return r.json()
-        raise _classify_error(r)
+        async for attempt in self._retrying():
+            with attempt:
+                async with self._sem, httpx.AsyncClient(timeout=self._timeout) as client:
+                    r = await client.patch(url, json=json, headers=headers)
+                if r.is_success:
+                    return r.json()
+                raise _classify_error(r)
+        raise RuntimeError('unreachable')  # pragma: no cover
 
     async def _delete(self, url: str) -> None:
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            r = await client.delete(url, headers=self._headers)
-        if r.is_success:
-            return
-        raise _classify_error(r)
+        async for attempt in self._retrying():
+            with attempt:
+                async with self._sem, httpx.AsyncClient(timeout=self._timeout) as client:
+                    r = await client.delete(url, headers=self._headers)
+                if r.is_success:
+                    return
+                raise _classify_error(r)
+        raise RuntimeError('unreachable')  # pragma: no cover
 
     async def list_events(
         self,
