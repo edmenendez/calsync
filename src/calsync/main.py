@@ -4,6 +4,7 @@ from fastapi import FastAPI
 
 from calsync import __version__
 from calsync.api.oauth import router as oauth_router
+from calsync.api.webhook import router as webhook_router
 from calsync.db import init_db
 from calsync.deps import get_settings
 
@@ -17,6 +18,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title='calsync', version=__version__, lifespan=lifespan)
 app.include_router(oauth_router)
+app.include_router(webhook_router)
 
 
 @app.get('/healthz')
