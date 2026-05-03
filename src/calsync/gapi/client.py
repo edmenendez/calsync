@@ -156,6 +156,15 @@ class GoogleCalendarClient:
                 raise _classify_error(r)
         raise RuntimeError('unreachable')  # pragma: no cover
 
+    async def get_event(self, calendar_id: str, event_id: str) -> dict:
+        """Fetch a single event. Raises NotFoundError on 404 / GoneError on 410.
+
+        Used by ensure_mirror's DB fast path to verify that a Google
+        mirror still exists before assuming the DB row is healthy.
+        """
+        url = f'{GOOGLE_API_BASE}/calendars/{calendar_id}/events/{event_id}'
+        return await self._get(url, {})
+
     async def list_events(
         self,
         calendar_id: str,
