@@ -8,13 +8,19 @@ from calsync.api.oauth import router as oauth_router
 from calsync.api.webhook import router as webhook_router
 from calsync.db import init_db
 from calsync.deps import get_settings
+from calsync.jobs.scheduler import create_scheduler
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
     init_db(settings.db_path)
-    yield
+    scheduler = create_scheduler(settings)
+    scheduler.start()
+    try:
+        yield
+    finally:
+        scheduler.shutdown(wait=False)
 
 
 app = FastAPI(title='calsync', version=__version__, lifespan=lifespan)
